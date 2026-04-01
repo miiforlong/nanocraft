@@ -165,6 +165,32 @@ class RubyDung:
         self.sock, self.remote_player_pos = None, None
         self.pending_blocks = []
 
+    # --- AJOUT LAN ---
+    def broadcast_host(self):
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while True:
+            try:
+                msg = f"NANOCRAFT_HOST:{PORT}"
+                udp.sendto(msg.encode(), ('255.255.255.255', PORT))
+            except:
+                pass
+            pygame.time.wait(2000)
+
+    def discover_host(self):
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp.bind(('', PORT))
+        while True:
+            try:
+                data, addr = udp.recvfrom(1024)
+                msg = data.decode()
+                if msg.startswith("NANOCRAFT_HOST"):
+                    return addr[0]
+            except:
+                pass
+    # --- FIN AJOUT ---
+
     def draw_crosshair(self):
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
@@ -184,10 +210,8 @@ class RubyDung:
         size = 8
 
         glBegin(GL_LINES)
-        # horizontal line
         glVertex2f(cx - size, cy)
         glVertex2f(cx + size, cy)
-        # vertical line
         glVertex2f(cx, cy - size)
         glVertex2f(cx, cy + size)
         glEnd()
@@ -215,7 +239,9 @@ class RubyDung:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('0.0.0.0', PORT)); s.listen(1)
                 self.sock, _ = s.accept()
             else:
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); self.sock.connect(('127.0.0.1', PORT))
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                host_ip = self.discover_host()
+                self.sock.connect((host_ip, PORT))
             
             self.sock.setblocking(False)
             while True:
@@ -281,9 +307,15 @@ class RubyDung:
                     if ev.key == K_ESCAPE: return
                     if self.state == self.STATE_MENU:
                         if ev.key in [K_1, K_KP1]: self.state = self.STATE_GAME
-                        elif ev.key in [K_2, K_KP2]: self.state = self.STATE_GAME; threading.Thread(target=self.network_thread, args=(True,), daemon=True).start()
-                        elif ev.key in [K_3, K_KP3]: self.state = self.STATE_GAME; threading.Thread(target=self.network_thread, args=(False,), daemon=True).start()
-                        if self.state == self.STATE_GAME: pygame.mouse.set_visible(False); pygame.event.set_grab(True)
+                        elif ev.key in [K_2, K_KP2]:
+                            self.state = self.STATE_GAME
+                            threading.Thread(target=self.network_thread, args=(True,), daemon=True).start()
+                            threading.Thread(target=self.broadcast_host, daemon=True).start()
+                        elif ev.key in [K_3, K_KP3]:
+                            self.state = self.STATE_GAME
+                            threading.Thread(target=self.network_thread, args=(False,), daemon=True).start()
+                        if self.state == self.STATE_GAME:
+                            pygame.mouse.set_visible(False); pygame.event.set_grab(True)
                 if self.state == self.STATE_GAME and ev.type == MOUSEBUTTONDOWN:
                     t, p = self.get_ray()
                     if ev.button == 1 and t: self.set_block(t, 0)
