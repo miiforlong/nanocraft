@@ -10,6 +10,10 @@ import pickle
 import struct
 import zlib
 import time
+import os
+import json
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 # --- CONFIGURATION ---
 WIDTH, HEIGHT = 1024, 768
@@ -18,10 +22,22 @@ MAP_W, MAP_D, MAP_H = 128, 64, 128
 RENDER_DIST = 96
 JAVA_RENDER_DIST_CHUNKS = 3
 JAVA_VERTICAL_RENDER_CHUNKS = 2
+JAVA_RENDER_KEEP_CHUNKS = 1
+JAVA_PREFETCH_CHUNKS = 1
 JAVA_LOADING_MIN_CHUNKS = 96
 JAVA_LOADING_IDLE_SECONDS = 3.0
-JAVA_LOADING_BUILD_BUDGET = 24
-JAVA_REBUILD_BUDGET = 2
+JAVA_LOADING_BUILD_BUDGET = 4
+JAVA_REBUILD_BUDGET = 1
+JAVA_LOADING_FRAME_BUDGET_MS = 5.0
+JAVA_REBUILD_FRAME_BUDGET_MS = 2.5
+JAVA_BLOCK_UPDATE_INTERVAL = 0.08
+JAVA_BLOCK_BURST_SECONDS = 0.25
+JAVA_BLOCK_REBUILD_BUDGET = 2
+JAVA_CHUNK_WORKERS = max(2, min(8, os.cpu_count() or 4))
+JAVA_CHUNK_QUEUE_LIMIT = 128
+JAVA_LAN_PORT_DEFAULT = 25565
+JAVA_LAN_MULTICAST_GROUP = "224.0.2.60"
+JAVA_LAN_MULTICAST_PORT = 4445
 PORT = 5555
 
 # =====================================================================
@@ -72,6 +88,17 @@ def read_string(data, offset):
 
 def read_angle(data, offset):
     return data[offset] * 360.0 / 256.0, offset + 1
+
+def pack_block_position(x, y, z):
+    value = ((int(x) & 0x3FFFFFF) << 38) | ((int(y) & 0xFFF) << 26) | (int(z) & 0x3FFFFFF)
+    if value >= (1 << 63):
+        value -= (1 << 64)
+    return struct.pack('>q', value)
+
+def write_slot(item_id=-1, count=0, damage=0):
+    if item_id < 0:
+        return struct.pack('>h', -1)
+    return struct.pack('>hb', item_id, count) + struct.pack('>h', damage) + b'\x00'
 
 def write_packet(packet_id, payload, compression_threshold=-1):
     """Encode un paquet complet avec support optionnel de la compression."""
@@ -327,6 +354,7 @@ class Level:
         # Java mode keeps an unbounded sparse block store instead of the fixed solo/LAN array.
         self.java_blocks = {}  # (x, y, z) -> block_id
         self.java_chunk_blocks = {}  # (cx, cy, cz) -> {(x, y, z): block_id}
+        self.java_visible_chunk_blocks = {}  # (cx, cy, cz) -> {(x, y, z): block_id}
         self.java_lock = threading.Lock()
         self.java_terrain_tex = None
 
@@ -351,6 +379,37 @@ class Level:
             (int(y) // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER,
             (int(z) // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER,
         )
+
+    def rebuild_java_visible_chunk(self, chunk_key):
+        chunk_blocks = self.java_chunk_blocks.get(chunk_key, {})
+        visible = {}
+        for (bx, by, bz), bid in chunk_blocks.items():
+            if bid == 0 or bid in JAVA_NON_CUBE_BLOCKS:
+                continue
+            if (not self.is_solid(bx + 1, by, bz) or
+                not self.is_solid(bx - 1, by, bz) or
+                not self.is_solid(bx, by + 1, bz) or
+                not self.is_solid(bx, by - 1, bz) or
+                not self.is_solid(bx, by, bz + 1) or
+                not self.is_solid(bx, by, bz - 1)):
+                visible[(bx, by, bz)] = bid
+        if visible:
+            self.java_visible_chunk_blocks[chunk_key] = visible
+        else:
+            self.java_visible_chunk_blocks.pop(chunk_key, None)
+
+    def rebuild_all_java_chunk_maps(self):
+        rebuilt = {}
+        for pos, bid in self.java_blocks.items():
+            if bid == 0:
+                continue
+            key = self.get_java_chunk_key(*pos)
+            if key not in rebuilt:
+                rebuilt[key] = {}
+            rebuilt[key][pos] = bid
+        self.java_chunk_blocks = rebuilt
+        self.java_visible_chunk_blocks.clear()
+        return set(rebuilt.keys())
 
 class Player:
     def __init__(self, level):
@@ -483,7 +542,7 @@ class Chunk:
 
         if self.level.java_mode:
             with self.level.java_lock:
-                chunk_blocks = self.level.java_chunk_blocks.get((x0, y0, z0), {})
+                chunk_blocks = self.level.java_visible_chunk_blocks.get((x0, y0, z0), {})
                 candidates = [
                     (bx, by, bz, bid)
                     for ((bx, by, bz), bid) in list(chunk_blocks.items())
@@ -579,6 +638,10 @@ class Chunk:
         if not self.list_id:
             raise RuntimeError("glGenLists a retournÃ© 0")
 
+        if self.level.java_mode:
+            with self.level.java_lock:
+                self.level.rebuild_java_visible_chunk(self.pos)
+
         glNewList(self.list_id, GL_COMPILE)
         if self.level.java_mode:
             glDisable(GL_TEXTURE_2D)
@@ -633,9 +696,17 @@ class MinecraftJavaClient:
         self.entity_lock = threading.Lock()
         self.remote_players = {}   # entity_id -> state dict
         self.entity_id = None
+        self.gamemode = 0
+        self.held_slot = 0
         self.chunks_received = 0
         self.last_chunk_time = 0.0
         self._thread = None
+        self.chunk_executor = ThreadPoolExecutor(max_workers=JAVA_CHUNK_WORKERS)
+        self.decode_lock = threading.Lock()
+        self.chunk_decode_seq = 0
+        self.chunk_apply_seq = 0
+        self.pending_chunk_futures = set()
+        self.completed_chunk_results = {}
 
     def connect(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -741,6 +812,7 @@ class MinecraftJavaClient:
                     entity_id = struct.unpack_from('>i', data, off)[0]; off += 4
                     self.entity_id = entity_id
                     gamemode   = data[off]; off += 1
+                    self.gamemode = gamemode & 0x7
                     dimension  = struct.unpack_from('>b', data, off)[0]; off += 1  # signed byte!
                     difficulty = data[off]; off += 1
                     max_players= data[off]; off += 1
@@ -862,6 +934,8 @@ class MinecraftJavaClient:
                     traceback.print_exc()
                     # Ne pas quitter sur une erreur de parsing - juste logger et continuer
                 return
+
+            self._drain_decoded_chunks(32)
             
             # Envoyer position pÃ©riodiquement (seulement aprÃ¨s le spawn)
             now = time.time()
@@ -881,7 +955,7 @@ class MinecraftJavaClient:
             primary_bitmask = struct.unpack_from('>H', data, off)[0]; off += 2
             data_size, off = read_varint(data, off)
             chunk_data  = bytes(data[off:off+data_size])
-            self._apply_chunk(chunk_data, chunk_x, chunk_z, primary_bitmask, 0, ground_up)
+            self._schedule_chunk_decode(chunk_data, chunk_x, chunk_z, primary_bitmask, 0, ground_up)
         except Exception as e:
             print(f"[CHUNK_SINGLE ERROR] {e}")
 
@@ -1057,7 +1131,7 @@ class MinecraftJavaClient:
                 sec_size = chunk_payload_size(pbm, sky_light)
                 chunk_raw = raw[raw_off:raw_off+sec_size]
                 raw_off += sec_size
-                self._apply_chunk(chunk_raw, cx, cz, pbm, 0, ground_up=True, sky_light=sky_light)
+                self._schedule_chunk_decode(chunk_raw, cx, cz, pbm, 0, ground_up=True, sky_light=sky_light)
 
             print(f"[BULK] {len(metas)} chunks traites, blocs total: {len(self.level.java_blocks)}")
             return len(metas)
@@ -1066,37 +1140,154 @@ class MinecraftJavaClient:
             print(f"[CHUNK_BULK ERROR] {e}")
             return 0
 
-    def _apply_chunk(self, chunk_data, chunk_x, chunk_z, primary_bitmask, add_bitmask, ground_up, sky_light=True):
-        """DÃ©code et applique un chunk au level."""
+    def _decode_chunk_task(self, seq, chunk_data, chunk_x, chunk_z, primary_bitmask, add_bitmask, ground_up, sky_light):
         try:
             new_blocks = decode_chunk_data_1_8(
                 chunk_data, primary_bitmask, add_bitmask,
                 ground_up, sky_light, chunk_x, chunk_z
             )
-            with self.chunk_lock:
-                if ground_up:
-                    to_del = [k for k in self.level.java_blocks
-                              if k[0] // 16 == chunk_x and k[2] // 16 == chunk_z]
-                    for k in to_del:
-                        del self.level.java_blocks[k]
-                    chunk_keys_to_del = [
-                        key for key in self.level.java_chunk_blocks
-                        if key[0] // 16 == chunk_x and key[2] // 16 == chunk_z
-                    ]
-                    for key in chunk_keys_to_del:
-                        del self.level.java_chunk_blocks[key]
-                self.level.java_blocks.update(new_blocks)
-                for pos, block_id in new_blocks.items():
-                    key = self.level.get_java_chunk_key(*pos)
-                    if key not in self.level.java_chunk_blocks:
-                        self.level.java_chunk_blocks[key] = {}
-                    self.level.java_chunk_blocks[key][pos] = block_id
-                affected = set()
-                for (bx, by, bz) in new_blocks:
-                    affected.add(((bx//16)*16, (by//16)*16, (bz//16)*16))
-                self.dirty_chunks.update(affected)
+            section_ys = [
+                section_y for section_y in range(16)
+                if (primary_bitmask >> section_y) & 1
+            ]
+            return (seq, chunk_x, chunk_z, ground_up, section_ys, new_blocks, None)
         except Exception as e:
-            print(f"[APPLY_CHUNK ERROR] ({chunk_x},{chunk_z}): {e}")
+            return (seq, chunk_x, chunk_z, ground_up, None, None, str(e))
+
+    def _store_chunk_result(self, result):
+        seq = result[0]
+        with self.decode_lock:
+            self.completed_chunk_results[seq] = result
+
+    def _schedule_chunk_decode(self, chunk_data, chunk_x, chunk_z, primary_bitmask, add_bitmask, ground_up, sky_light=True):
+        with self.decode_lock:
+            seq = self.chunk_decode_seq
+            self.chunk_decode_seq += 1
+            queued = len(self.pending_chunk_futures)
+
+        if queued >= JAVA_CHUNK_QUEUE_LIMIT:
+            self._store_chunk_result(
+                self._decode_chunk_task(seq, chunk_data, chunk_x, chunk_z, primary_bitmask, add_bitmask, ground_up, sky_light)
+            )
+            return
+
+        future = self.chunk_executor.submit(
+            self._decode_chunk_task,
+            seq, chunk_data, chunk_x, chunk_z, primary_bitmask, add_bitmask, ground_up, sky_light
+        )
+        with self.decode_lock:
+            self.pending_chunk_futures.add(future)
+
+        def _done_callback(done_future):
+            with self.decode_lock:
+                self.pending_chunk_futures.discard(done_future)
+            try:
+                result = done_future.result()
+            except Exception as e:
+                result = (seq, chunk_x, chunk_z, ground_up, None, None, str(e))
+            self._store_chunk_result(result)
+
+        future.add_done_callback(_done_callback)
+
+    def _apply_decoded_chunk(self, chunk_x, chunk_z, ground_up, section_ys, new_blocks):
+        with self.chunk_lock:
+            affected = set()
+            if ground_up:
+                to_del = [k for k in self.level.java_blocks
+                          if k[0] // 16 == chunk_x and k[2] // 16 == chunk_z]
+                for k in to_del:
+                    del self.level.java_blocks[k]
+                chunk_keys_to_del = [
+                    key for key in self.level.java_chunk_blocks
+                    if key[0] // 16 == chunk_x and key[2] // 16 == chunk_z
+                ]
+                for key in chunk_keys_to_del:
+                    del self.level.java_chunk_blocks[key]
+                    self.level.java_visible_chunk_blocks.pop(key, None)
+                affected.update(chunk_keys_to_del)
+            elif section_ys:
+                sections = set(section_ys)
+                to_del = [
+                    k for k in self.level.java_blocks
+                    if k[0] // 16 == chunk_x and k[2] // 16 == chunk_z and (k[1] // 16) in sections
+                ]
+                for k in to_del:
+                    del self.level.java_blocks[k]
+                chunk_keys_to_rebuild = set()
+                for key, bucket in list(self.level.java_chunk_blocks.items()):
+                    if key[0] // 16 != chunk_x or key[2] // 16 != chunk_z:
+                        continue
+                    kept = {
+                        pos: bid for pos, bid in bucket.items()
+                        if (pos[1] // 16) not in sections
+                    }
+                    if kept:
+                        self.level.java_chunk_blocks[key] = kept
+                    else:
+                        del self.level.java_chunk_blocks[key]
+                    self.level.java_visible_chunk_blocks.pop(key, None)
+                    chunk_keys_to_rebuild.add(key)
+                affected.update(chunk_keys_to_rebuild)
+            self.level.java_blocks.update(new_blocks)
+            for pos, block_id in new_blocks.items():
+                key = self.level.get_java_chunk_key(*pos)
+                if key not in self.level.java_chunk_blocks:
+                    self.level.java_chunk_blocks[key] = {}
+                self.level.java_chunk_blocks[key][pos] = block_id
+            for (bx, by, bz) in new_blocks:
+                affected.add(((bx//16)*16, (by//16)*16, (bz//16)*16))
+
+            expanded = set(affected)
+            for (cx, cy, cz) in list(affected):
+                expanded.add((cx + CHUNK_SIZE_RENDER, cy, cz))
+                expanded.add((cx - CHUNK_SIZE_RENDER, cy, cz))
+                expanded.add((cx, cy + CHUNK_SIZE_RENDER, cz))
+                expanded.add((cx, cy - CHUNK_SIZE_RENDER, cz))
+                expanded.add((cx, cy, cz + CHUNK_SIZE_RENDER))
+                expanded.add((cx, cy, cz - CHUNK_SIZE_RENDER))
+            self.dirty_chunks.update(expanded)
+
+    def _drain_decoded_chunks(self, max_chunks=None):
+        applied = 0
+        while True:
+            with self.decode_lock:
+                result = self.completed_chunk_results.pop(self.chunk_apply_seq, None)
+            if result is None:
+                break
+
+            _, chunk_x, chunk_z, ground_up, section_ys, new_blocks, error = result
+            if error:
+                print(f"[APPLY_CHUNK ERROR] ({chunk_x},{chunk_z}): {error}")
+            else:
+                self._apply_decoded_chunk(chunk_x, chunk_z, ground_up, section_ys, new_blocks)
+
+            self.chunk_apply_seq += 1
+            applied += 1
+            if max_chunks is not None and applied >= max_chunks:
+                break
+        return applied
+
+    def _mark_dirty_block_chunks(self, bx, by, bz):
+        cx = (bx // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
+        cy = (by // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
+        cz = (bz // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
+        self.dirty_chunks.add((cx, cy, cz))
+
+        local_x = bx - cx
+        local_y = by - cy
+        local_z = bz - cz
+        if local_x == 0:
+            self.dirty_chunks.add((cx - CHUNK_SIZE_RENDER, cy, cz))
+        elif local_x == CHUNK_SIZE_RENDER - 1:
+            self.dirty_chunks.add((cx + CHUNK_SIZE_RENDER, cy, cz))
+        if local_y == 0:
+            self.dirty_chunks.add((cx, cy - CHUNK_SIZE_RENDER, cz))
+        elif local_y == CHUNK_SIZE_RENDER - 1:
+            self.dirty_chunks.add((cx, cy + CHUNK_SIZE_RENDER, cz))
+        if local_z == 0:
+            self.dirty_chunks.add((cx, cy, cz - CHUNK_SIZE_RENDER))
+        elif local_z == CHUNK_SIZE_RENDER - 1:
+            self.dirty_chunks.add((cx, cy, cz + CHUNK_SIZE_RENDER))
 
     def _handle_block_change(self, data, off):
         """Paquet 0x23 - Block Change"""
@@ -1122,17 +1313,15 @@ class MinecraftJavaClient:
                         bucket.pop((bx, by, bz), None)
                         if not bucket:
                             del self.level.java_chunk_blocks[key]
+                            self.level.java_visible_chunk_blocks.pop(key, None)
                 else:
                     self.level.java_blocks[(bx, by, bz)] = block_id
                     key = self.level.get_java_chunk_key(bx, by, bz)
                     if key not in self.level.java_chunk_blocks:
                         self.level.java_chunk_blocks[key] = {}
                     self.level.java_chunk_blocks[key][(bx, by, bz)] = block_id
-                
-                cx = (bx // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
-                cy = (by // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
-                cz = (bz // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
-                self.dirty_chunks.add((cx, cy, cz))
+
+                self._mark_dirty_block_chunks(bx, by, bz)
         except:
             pass
 
@@ -1162,17 +1351,15 @@ class MinecraftJavaClient:
                             bucket.pop((bx, y, bz), None)
                             if not bucket:
                                 del self.level.java_chunk_blocks[key]
+                                self.level.java_visible_chunk_blocks.pop(key, None)
                     else:
                         self.level.java_blocks[(bx, y, bz)] = block_id
                         key = self.level.get_java_chunk_key(bx, y, bz)
                         if key not in self.level.java_chunk_blocks:
                             self.level.java_chunk_blocks[key] = {}
                         self.level.java_chunk_blocks[key][(bx, y, bz)] = block_id
-                    
-                    cx = (bx // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
-                    cy = (y // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
-                    cz = (bz // CHUNK_SIZE_RENDER) * CHUNK_SIZE_RENDER
-                    self.dirty_chunks.add((cx, cy, cz))
+
+                    self._mark_dirty_block_chunks(bx, y, bz)
         except:
             pass
 
@@ -1210,13 +1397,410 @@ class MinecraftJavaClient:
         except Exception as e:
             print(f"[CLIENT] Erreur client settings: {e}")
 
+    def send_held_item_change(self, slot):
+        try:
+            self.held_slot = max(0, min(8, int(slot)))
+            self._send(0x09, struct.pack(">h", self.held_slot))
+        except Exception as e:
+            print(f"[CLIENT] Erreur held item change: {e}")
+
+    def send_creative_inventory_action(self, slot, item_id, count=1, damage=0):
+        try:
+            payload = struct.pack(">h", slot) + write_slot(item_id, count, damage)
+            self._send(0x10, payload)
+            return True
+        except Exception as e:
+            print(f"[CLIENT] Erreur creative inventory action: {e}")
+            return False
+
+    def send_dig_status(self, status, pos, face):
+        try:
+            payload = struct.pack(">b", status) + pack_block_position(*pos) + struct.pack(">B", face)
+            self._send(0x07, payload)
+            return True
+        except Exception as e:
+            print(f"[CLIENT] Erreur dig block: {e}")
+            return False
+
+    def send_dig_block(self, pos, face):
+        if not self.send_dig_status(0, pos, face):
+            return False
+        return self.send_dig_status(2, pos, face)
+
+    def send_place_block(self, target_pos, face, item_id):
+        try:
+            if self.gamemode == 1:
+                self.send_creative_inventory_action(36 + self.held_slot, item_id, 64, 0)
+            payload = (
+                pack_block_position(*target_pos) +
+                struct.pack(">B", face) +
+                write_slot(item_id, 1, 0) +
+                struct.pack(">BBB", 8, 8, 8)
+            )
+            self._send(0x08, payload)
+            return True
+        except Exception as e:
+            print(f"[CLIENT] Erreur place block: {e}")
+            return False
+
     def disconnect(self):
         self.connected = False
+        self._drain_decoded_chunks()
         with self.entity_lock:
             self.remote_players.clear()
+        if self.chunk_executor:
+            try:
+                self.chunk_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                self.chunk_executor.shutdown(wait=False)
         if self.sock:
             try: self.sock.close()
             except: pass
+
+# =====================================================================
+# SERVEUR JAVA LAN MINIMAL (1.8 / protocole 47)
+# =====================================================================
+
+class JavaLanServer:
+    PROTOCOL_VERSION = 47
+
+    def __init__(self, level, on_status=None, on_block_update=None):
+        self.level = level
+        self.on_status = on_status
+        self.on_block_update = on_block_update
+        self.running = False
+        self.sock = None
+        self.port = None
+        self.clients = []
+        self.clients_lock = threading.Lock()
+        self.entity_seq = 1000
+        self.accept_thread = None
+        self.announce_thread = None
+
+    def start(self, preferred_port=JAVA_LAN_PORT_DEFAULT):
+        if self.running:
+            return self.port
+
+        bind_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        bind_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        chosen_port = None
+        for port in range(preferred_port, preferred_port + 20):
+            try:
+                bind_sock.bind(("0.0.0.0", port))
+                chosen_port = port
+                break
+            except OSError:
+                continue
+        if chosen_port is None:
+            bind_sock.close()
+            raise OSError("Impossible de trouver un port Java LAN libre")
+
+        bind_sock.listen(5)
+        bind_sock.settimeout(0.5)
+        self.sock = bind_sock
+        self.port = chosen_port
+        self.running = True
+        self.accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self.accept_thread.start()
+        self.announce_thread = threading.Thread(target=self._announce_loop, daemon=True)
+        self.announce_thread.start()
+        self._status(f"Java LAN server on port {self.port}")
+        return self.port
+
+    def stop(self):
+        self.running = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+        with self.clients_lock:
+            clients = list(self.clients)
+            self.clients.clear()
+        for client in clients:
+            try:
+                client["sock"].close()
+            except:
+                pass
+
+    def _status(self, msg):
+        if self.on_status:
+            self.on_status(msg)
+        print("[JAVA LAN]", msg)
+
+    def _send_packet(self, sock, packet_id, payload):
+        sock.sendall(write_packet(packet_id, payload, -1))
+
+    def _accept_loop(self):
+        while self.running and self.sock:
+            try:
+                client_sock, addr = self.sock.accept()
+                client_sock.settimeout(10)
+                threading.Thread(target=self._handle_client, args=(client_sock, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as e:
+                self._status(f"Accept error: {e}")
+
+    def _announce_loop(self):
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            udp.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            while self.running:
+                motd = f"[MOTD]Nanocraft LAN[/MOTD][AD]{self.port}[/AD]"
+                try:
+                    udp.sendto(motd.encode("utf-8"), (JAVA_LAN_MULTICAST_GROUP, JAVA_LAN_MULTICAST_PORT))
+                except:
+                    pass
+                time.sleep(1.5)
+        finally:
+            udp.close()
+
+    def _handle_client(self, client_sock, addr):
+        try:
+            pid, data, off = recv_packet(client_sock, -1)
+            if pid != 0x00:
+                client_sock.close()
+                return
+
+            protocol, off = read_varint(data, off)
+            host, off = read_string(data, off)
+            server_port = struct.unpack_from(">H", data, off)[0]; off += 2
+            next_state, off = read_varint(data, off)
+
+            if next_state == 1:
+                self._handle_status(client_sock)
+                return
+            if next_state == 2:
+                self._handle_login(client_sock)
+                return
+        except Exception as e:
+            self._status(f"Client error {addr}: {e}")
+        try:
+            client_sock.close()
+        except:
+            pass
+
+    def _handle_status(self, client_sock):
+        pid, data, off = recv_packet(client_sock, -1)
+        if pid == 0x00:
+            status = {
+                "version": {"name": "1.8", "protocol": self.PROTOCOL_VERSION},
+                "players": {"max": 8, "online": 0, "sample": []},
+                "description": {"text": "Nanocraft LAN"},
+            }
+            self._send_packet(client_sock, 0x00, write_string(json.dumps(status)))
+        pid, data, off = recv_packet(client_sock, -1)
+        if pid == 0x01:
+            self._send_packet(client_sock, 0x01, data[off:])
+        client_sock.close()
+
+    def _handle_login(self, client_sock):
+        pid, data, off = recv_packet(client_sock, -1)
+        if pid != 0x00:
+            client_sock.close()
+            return
+        username, off = read_string(data, off)
+        user_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, "nanocraft:" + username))
+        self._send_packet(client_sock, 0x02, write_string(user_uuid) + write_string(username))
+        self._enter_play(client_sock, username)
+
+    def _apply_block_update(self, pos, block_id):
+        if self.on_block_update:
+            self.on_block_update(pos, block_id, True)
+            return
+        x, y, z = pos
+        if 0 <= x < self.level.w and 0 <= y < self.level.d and 0 <= z < self.level.h:
+            self.level.blocks[x, y, z] = block_id
+
+    def _offset_from_face(self, face):
+        if face == 0:
+            return (0, -1, 0)
+        if face == 1:
+            return (0, 1, 0)
+        if face == 2:
+            return (0, 0, -1)
+        if face == 3:
+            return (0, 0, 1)
+        if face == 4:
+            return (-1, 0, 0)
+        if face == 5:
+            return (1, 0, 0)
+        return (0, 0, 0)
+
+    def _handle_play_packet(self, pid, data, off):
+        try:
+            if pid == 0x07:
+                status = struct.unpack_from(">b", data, off)[0]; off += 1
+                pos_long = struct.unpack_from(">q", data, off)[0]; off += 8
+                face = data[off]
+                bx = pos_long >> 38
+                by = (pos_long >> 26) & 0xFFF
+                bz = pos_long << 38 >> 38
+                if bx >= (1 << 25): bx -= (1 << 26)
+                if bz >= (1 << 25): bz -= (1 << 26)
+                if status in (0, 2):
+                    self._apply_block_update((bx, by, bz), 0)
+                return
+
+            if pid == 0x08:
+                pos_long = struct.unpack_from(">q", data, off)[0]; off += 8
+                face = data[off]; off += 1
+                item_id = struct.unpack_from(">h", data, off)[0]; off += 2
+                if item_id >= 0:
+                    off += 1  # count
+                    off += 2  # damage
+                    nbt_len = struct.unpack_from(">h", data, off)[0]; off += 2
+                    if nbt_len > 0:
+                        off += nbt_len
+                bx = pos_long >> 38
+                by = (pos_long >> 26) & 0xFFF
+                bz = pos_long << 38 >> 38
+                if bx >= (1 << 25): bx -= (1 << 26)
+                if bz >= (1 << 25): bz -= (1 << 26)
+                if face <= 5:
+                    dx, dy, dz = self._offset_from_face(face)
+                    block_id = item_id if item_id in (1, 2) else 1
+                    self._apply_block_update((bx + dx, by + dy, bz + dz), block_id)
+                return
+        except Exception as e:
+            self._status(f"Play packet error: {e}")
+
+    def _enter_play(self, client_sock, username):
+        entity_id = self.entity_seq
+        self.entity_seq += 1
+        client_sock.settimeout(0.2)
+        client = {"sock": client_sock, "entity_id": entity_id, "username": username}
+        with self.clients_lock:
+            self.clients.append(client)
+
+        spawn_x = self.level.w // 2
+        spawn_z = self.level.h // 2
+        top_y = 0
+        for y in range(self.level.d - 1, -1, -1):
+            if int(self.level.blocks[spawn_x, y, spawn_z]) != 0:
+                top_y = y
+                break
+        feet_y = float(top_y + 2)
+
+        join_payload = (
+            struct.pack(">i", entity_id) +
+            struct.pack(">B", 1) +      # creative for free movement
+            struct.pack(">b", 0) +      # overworld
+            struct.pack(">B", 2) +      # difficulty
+            struct.pack(">B", 8) +
+            write_string("default") +
+            struct.pack(">?", False)
+        )
+        self._send_packet(client_sock, 0x01, join_payload)
+        self._send_packet(client_sock, 0x05, pack_block_position(spawn_x, top_y + 1, spawn_z))
+        abilities = struct.pack(">Bff", 0x07, 0.05, 0.1)
+        self._send_packet(client_sock, 0x39, abilities)
+        poslook = (
+            struct.pack(">d", spawn_x + 0.5) +
+            struct.pack(">d", feet_y) +
+            struct.pack(">d", spawn_z + 0.5) +
+            struct.pack(">f", 0.0) +
+            struct.pack(">f", 0.0) +
+            struct.pack(">B", 0)
+        )
+        self._send_packet(client_sock, 0x08, poslook)
+        self._send_all_chunks(client_sock)
+
+        try:
+            while self.running:
+                try:
+                    pid, data, off = recv_packet(client_sock, -1)
+                    self._handle_play_packet(pid, data, off)
+                except socket.timeout:
+                    continue
+        except Exception:
+            pass
+        finally:
+            with self.clients_lock:
+                if client in self.clients:
+                    self.clients.remove(client)
+            try:
+                client_sock.close()
+            except:
+                pass
+
+    def _send_all_chunks(self, client_sock):
+        max_cx = self.level.w // 16
+        max_cz = self.level.h // 16
+        for cx in range(max_cx):
+            for cz in range(max_cz):
+                payload = self._build_chunk_payload(cx, cz)
+                if payload is not None:
+                    self._send_packet(client_sock, 0x21, payload)
+
+    def _build_chunk_payload(self, chunk_x, chunk_z):
+        primary_bitmask = 0
+        data = bytearray()
+        for section_y in range(16):
+            y0 = section_y * 16
+            if y0 >= self.level.d:
+                break
+            has_blocks = False
+            packed = bytearray(8192)
+            for by_local in range(16):
+                wy = y0 + by_local
+                if wy >= self.level.d:
+                    continue
+                for bz_local in range(16):
+                    wz = chunk_z * 16 + bz_local
+                    if wz >= self.level.h:
+                        continue
+                    for bx_local in range(16):
+                        wx = chunk_x * 16 + bx_local
+                        if wx >= self.level.w:
+                            continue
+                        bid = int(self.level.blocks[wx, wy, wz])
+                        if bid == 0:
+                            continue
+                        has_blocks = True
+                        i = bx_local | (bz_local << 4) | (by_local << 8)
+                        packed[i * 2] = (bid & 0xF) << 4
+                        packed[i * 2 + 1] = (bid >> 4) & 0xFF
+            if not has_blocks:
+                continue
+            primary_bitmask |= (1 << section_y)
+            data.extend(packed)
+            data.extend(bytearray(2048))
+            data.extend(bytearray([0xFF]) * 2048)
+
+        if primary_bitmask == 0:
+            return None
+
+        data.extend(bytearray([1]) * 256)
+        payload = (
+            struct.pack(">i", chunk_x) +
+            struct.pack(">i", chunk_z) +
+            struct.pack(">?", True) +
+            struct.pack(">H", primary_bitmask) +
+            write_varint(len(data)) +
+            bytes(data)
+        )
+        return payload
+
+    def broadcast_block_change(self, pos, block_id):
+        payload = pack_block_position(*pos) + write_varint(int(block_id) << 4)
+        with self.clients_lock:
+            clients = list(self.clients)
+        dead = []
+        for client in clients:
+            try:
+                self._send_packet(client["sock"], 0x23, payload)
+            except:
+                dead.append(client)
+        if dead:
+            with self.clients_lock:
+                for client in dead:
+                    if client in self.clients:
+                        self.clients.remove(client)
 
 # =====================================================================
 # IP INPUT SCREEN
@@ -1297,7 +1881,7 @@ class IPInputScreen:
 class RubyDung:
     def __init__(self):
         pygame.init()
-        pygame.display.set_mode((WIDTH, HEIGHT), DOUBLEBUF | OPENGL)
+        pygame.display.set_mode((WIDTH, HEIGHT), DOUBLEBUF | OPENGL | RESIZABLE)
         pygame.display.set_caption("Nanocraft")
         pygame.font.init()
         
@@ -1338,7 +1922,119 @@ class RubyDung:
         self.java_status = "Not connected"
         self.java_loading = False
         self.java_loading_start = 0.0
+        self.last_java_block_refresh = 0.0
+        self.java_block_burst_until = 0.0
+        self.java_last_ip = None
+        self.java_last_port = None
+        self.java_last_username = None
+        self.java_lan_server = None
+        self.java_visible_cache = {}
+        self.java_visible_cache_epoch = 0
+        self.hotbar_blocks = [("Stone", 1, (120, 120, 120)), ("Grass", 2, (80, 170, 80))]
+        self.selected_hotbar = 0
+        self.hotbar_counts = {1: 999, 2: 999}
+        self.last_java_break_time = 0.0
+        self.pending_java_break = None
         self.ip_screen = None
+        self.current_fps = 0.0
+        glViewport(0, 0, WIDTH, HEIGHT)
+
+    def resize_window(self, width, height):
+        global WIDTH, HEIGHT
+        WIDTH = max(320, int(width))
+        HEIGHT = max(240, int(height))
+        pygame.display.set_mode((WIDTH, HEIGHT), DOUBLEBUF | OPENGL | RESIZABLE)
+        glViewport(0, 0, WIDTH, HEIGHT)
+        if self.ip_screen:
+            self.ip_screen.width = WIDTH
+            self.ip_screen.height = HEIGHT
+
+    def is_java_survival(self):
+        return bool(self.java_client and self.java_client.gamemode == 0)
+
+    def get_visible_hotbar_entries(self):
+        if self.is_java_survival():
+            return [entry for entry in self.hotbar_blocks if entry[1] != 1]
+        return list(self.hotbar_blocks)
+
+    def get_selected_block_id(self):
+        entries = self.get_visible_hotbar_entries()
+        return entries[self.selected_hotbar][1]
+
+    def reset_java_survival_inventory(self):
+        self.hotbar_counts = {1: 0, 2: 0}
+
+    def add_hotbar_resource(self, block_id, amount=1):
+        if block_id in self.hotbar_counts:
+            self.hotbar_counts[block_id] += amount
+
+    def consume_hotbar_resource(self, block_id, amount=1):
+        if not self.is_java_survival():
+            return True
+        current = self.hotbar_counts.get(block_id, 0)
+        if current < amount:
+            return False
+        self.hotbar_counts[block_id] = current - amount
+        return True
+
+    def get_java_survival_break_time(self, block_id):
+        # Match Minecraft hand-breaking time closely for the two supported blocks.
+        if block_id == 1:
+            return 4.0
+        if block_id == 2:
+            return 4.0
+        return 0.75
+
+    def select_hotbar_slot(self, slot):
+        entries = self.get_visible_hotbar_entries()
+        self.selected_hotbar = max(0, min(len(entries) - 1, int(slot)))
+        if self.java_client:
+            self.java_client.send_held_item_change(self.selected_hotbar)
+            if self.java_client.gamemode == 1:
+                self.java_client.send_creative_inventory_action(
+                    36 + self.selected_hotbar,
+                    self.get_selected_block_id(),
+                    64,
+                    0,
+                )
+
+    def apply_local_java_block_change(self, pos, block_id):
+        if not self.java_client:
+            return
+        x, y, z = pos
+        key = self.level.get_java_chunk_key(x, y, z)
+        with self.java_client.chunk_lock:
+            if block_id == 0:
+                self.level.java_blocks.pop((x, y, z), None)
+                bucket = self.level.java_chunk_blocks.get(key)
+                if bucket is not None:
+                    bucket.pop((x, y, z), None)
+                    if not bucket:
+                        del self.level.java_chunk_blocks[key]
+                        self.level.java_visible_chunk_blocks.pop(key, None)
+            else:
+                self.level.java_blocks[(x, y, z)] = block_id
+                if key not in self.level.java_chunk_blocks:
+                    self.level.java_chunk_blocks[key] = {}
+                self.level.java_chunk_blocks[key][(x, y, z)] = block_id
+            self.level.java_visible_chunk_blocks.pop(key, None)
+            self.java_client._mark_dirty_block_chunks(x, y, z)
+
+    def process_pending_java_break(self):
+        if not self.pending_java_break or not self.java_client:
+            return
+        if time.time() < self.pending_java_break["ready_time"]:
+            return
+
+        pos = self.pending_java_break["pos"]
+        face = self.pending_java_break["face"]
+        block_id = self.pending_java_break["block_id"]
+        self.pending_java_break = None
+
+        if self.java_client.send_dig_status(2, pos, face):
+            self.apply_local_java_block_change(pos, 0)
+            if self.is_java_survival() and block_id != 1:
+                self.add_hotbar_resource(block_id, 1)
 
     # ---- Classic LAN mode ----
     def broadcast_host(self):
@@ -1385,18 +2081,48 @@ class RubyDung:
                 pygame.time.wait(20)
         except: pass
 
+    def start_host_lan_services(self):
+        threading.Thread(target=self.network_thread, args=(True,), daemon=True).start()
+        threading.Thread(target=self.broadcast_host, daemon=True).start()
+        try:
+            if not self.java_lan_server:
+                self.java_lan_server = JavaLanServer(self.level, on_block_update=self.set_block)
+            port = self.java_lan_server.start()
+            print(f"[HOST] Java LAN server started on {port}")
+        except Exception as e:
+            print(f"[HOST] Java LAN server error: {e}")
+
+    def stop_host_lan_services(self):
+        if self.java_lan_server:
+            self.java_lan_server.stop()
+            self.java_lan_server = None
+
     # ---- Java connection ----
     def start_java_connection(self, ip, port, username):
         """Start a connection to a Java Minecraft server."""
+        self.java_last_ip = ip
+        self.java_last_port = int(port)
+        self.java_last_username = username
+
+        if self.java_client:
+            self.java_client.disconnect()
+
         # Reset the local level so Java chunk data can replace the fixed solo/LAN terrain.
         self.level = Level(MAP_W, MAP_D, MAP_H)
         self.level.java_mode = True
         self.level.java_terrain_tex = self.tex
         self.player = Player(self.level)
         self.java_chunks = {}
+        self.java_visible_cache = {}
+        self.java_visible_cache_epoch = 0
+        self.reset_java_survival_inventory()
+        self.last_java_break_time = 0.0
+        self.pending_java_break = None
         self.java_status = "Connecting..."
         self.java_loading = True
         self.java_loading_start = time.time()
+        self.last_java_block_refresh = 0.0
+        self.java_block_burst_until = 0.0
         
         self.java_client = MinecraftJavaClient(
             ip, int(port), username,
@@ -1420,20 +2146,37 @@ class RubyDung:
             c.list_id = None
             c.dirty = True
             self.java_chunks[key] = c
+            self.java_visible_cache_epoch += 1
+            self.java_visible_cache.clear()
         return self.java_chunks[key]
 
     def update_java_chunks(self):
-        """Rebuild chunks marked dirty by the Java networking client."""
+        """Flush block-only Java updates to the renderer at a fixed interval."""
         if not self.java_client:
-            return
+            return 0
+
+        now = time.time()
+        if now - self.last_java_block_refresh < JAVA_BLOCK_UPDATE_INTERVAL:
+            return 0
+        self.last_java_block_refresh = now
         
         with self.java_client.chunk_lock:
             dirty = set(self.java_client.dirty_chunks)
             self.java_client.dirty_chunks.clear()
+
+        if dirty:
+            self.java_block_burst_until = now + JAVA_BLOCK_BURST_SECONDS
         
         for (cx, cy, cz) in dirty:
             c = self.get_or_create_java_chunk(cx, cy, cz)
             c.dirty = True
+        return len(dirty)
+
+    def reload_java_nearby_chunks(self):
+        if not self.java_last_ip or self.java_last_port is None or not self.java_last_username:
+            return
+        self.java_status = "Reloading chunks from server..."
+        self.start_java_connection(self.java_last_ip, self.java_last_port, self.java_last_username)
 
     # ---- Drawing ----
     def draw_crosshair(self):
@@ -1487,6 +2230,8 @@ class RubyDung:
     def draw_steve_lan(self, pos):
         rx, ry, rz, rr = pos
         glPushMatrix(); glTranslatef(rx, ry-1.6, rz); glRotatef(-rr, 0, 1, 0)
+        glEnable(GL_TEXTURE_2D)
+        glColor3f(1.0, 1.0, 1.0)
         glBindTexture(GL_TEXTURE_2D, self.skin_tex)
         self.draw_cube_face(-0.375, 0.0, 0.125, 0.375, 1.75, 0.125, 8, 0, 16, 32)
         self.draw_cube_face(0.375, 0.0, -0.125, -0.375, 1.75, -0.125, 0, 0, 8, 32)
@@ -1510,6 +2255,133 @@ class RubyDung:
         glDrawPixels(surf.get_width(), surf.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, data)
         glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glEnable(GL_TEXTURE_2D)
         glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW)
+
+    def draw_fps(self, is_java=False):
+        y = 110 if is_java else 45
+        self.draw_text(f"FPS: {self.current_fps:.0f}", 10, y, (255, 255, 255), small=True)
+
+    def draw_ui_block_tile(self, block_id, x, y, size=26):
+        if not self.tex:
+            return
+        s = 0.0625
+        u0 = (block_id - 1) * s
+        u1 = u0 + s
+        v0 = 1.0 - s
+        v1 = 1.0
+
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+        gluOrtho2D(0, WIDTH, HEIGHT, 0)
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, self.tex)
+        glColor3f(1.0, 1.0, 1.0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(u0, v1); glVertex2f(x, y)
+        glTexCoord2f(u1, v1); glVertex2f(x + size, y)
+        glTexCoord2f(u1, v0); glVertex2f(x + size, y + size)
+        glTexCoord2f(u0, v0); glVertex2f(x, y + size)
+        glEnd()
+        glDisable(GL_BLEND)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_DEPTH_TEST)
+        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW)
+
+    def draw_hotbar(self):
+        entries = self.get_visible_hotbar_entries()
+        slot_w = 90
+        slot_h = 54
+        gap = 10
+        total_w = len(entries) * slot_w + (len(entries) - 1) * gap
+        x0 = (WIDTH - total_w) // 2
+        y0 = HEIGHT - slot_h - 18
+
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+        gluOrtho2D(0, WIDTH, HEIGHT, 0)
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_TEXTURE_2D)
+
+        for i, (_, _, color) in enumerate(entries):
+            sx = x0 + i * (slot_w + gap)
+            selected = (i == self.selected_hotbar)
+            border = (1.0, 1.0, 0.6) if selected else (0.25, 0.25, 0.25)
+            fill = tuple(min(1.0, c / 255.0 + (0.12 if selected else 0.0)) for c in color)
+            icon_x0 = sx + 18
+            icon_y0 = y0 + 10
+            icon_x1 = icon_x0 + 26
+            icon_y1 = icon_y0 + 26
+
+            glColor3f(*border)
+            glBegin(GL_QUADS)
+            glVertex2f(sx, y0); glVertex2f(sx + slot_w, y0)
+            glVertex2f(sx + slot_w, y0 + slot_h); glVertex2f(sx, y0 + slot_h)
+            glEnd()
+
+            glColor3f(0.08, 0.08, 0.08)
+            glBegin(GL_QUADS)
+            glVertex2f(sx + 3, y0 + 3); glVertex2f(sx + slot_w - 3, y0 + 3)
+            glVertex2f(sx + slot_w - 3, y0 + slot_h - 3); glVertex2f(sx + 3, y0 + slot_h - 3)
+            glEnd()
+
+            glColor3f(*fill)
+            glBegin(GL_QUADS)
+            glVertex2f(icon_x0, icon_y0); glVertex2f(icon_x1, icon_y0)
+            glVertex2f(icon_x1, icon_y1); glVertex2f(icon_x0, icon_y1)
+            glEnd()
+
+            if selected:
+                glColor3f(0.0, 0.0, 0.0)
+                glBegin(GL_QUADS)
+                glVertex2f(icon_x0 - 2, icon_y0 - 2); glVertex2f(icon_x1 + 2, icon_y0 - 2)
+                glVertex2f(icon_x1 + 2, icon_y0); glVertex2f(icon_x0 - 2, icon_y0)
+                glEnd()
+                glBegin(GL_QUADS)
+                glVertex2f(icon_x0 - 2, icon_y1); glVertex2f(icon_x1 + 2, icon_y1)
+                glVertex2f(icon_x1 + 2, icon_y1 + 2); glVertex2f(icon_x0 - 2, icon_y1 + 2)
+                glEnd()
+                glBegin(GL_QUADS)
+                glVertex2f(icon_x0 - 2, icon_y0); glVertex2f(icon_x0, icon_y0)
+                glVertex2f(icon_x0, icon_y1); glVertex2f(icon_x0 - 2, icon_y1)
+                glEnd()
+                glBegin(GL_QUADS)
+                glVertex2f(icon_x1, icon_y0); glVertex2f(icon_x1 + 2, icon_y0)
+                glVertex2f(icon_x1 + 2, icon_y1); glVertex2f(icon_x1, icon_y1)
+                glEnd()
+
+        glEnable(GL_DEPTH_TEST)
+        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW)
+
+        for i, (_, block_id, _) in enumerate(entries):
+            sx = x0 + i * (slot_w + gap)
+            self.draw_text(str(i + 1), sx + 8, y0 + 10, (255, 255, 255), small=True)
+            self.draw_ui_block_tile(block_id, sx + 18, y0 + 10, 26)
+            if self.is_java_survival():
+                count = self.hotbar_counts.get(block_id, 0)
+                self.draw_text(str(count), sx + 48, y0 + 28, (230, 230, 230), small=True)
+
+    def get_block_face(self, target, adjacent):
+        if not target or not adjacent:
+            return 1
+        dx = adjacent[0] - target[0]
+        dy = adjacent[1] - target[1]
+        dz = adjacent[2] - target[2]
+        if dy > 0:
+            return 1
+        if dy < 0:
+            return 0
+        if dz < 0:
+            return 2
+        if dz > 0:
+            return 3
+        if dx < 0:
+            return 4
+        if dx > 0:
+            return 5
+        return 1
 
     def draw_menu(self):
         glClearColor(0.1, 0.1, 0.1, 1.0)
@@ -1536,39 +2408,88 @@ class RubyDung:
                 return False
         return True
 
-    def _get_java_visible_chunks(self):
+    def _get_java_visible_chunks(self, extra_chunks=0, cull_behind=False):
         px, py, pz = self.player.x, self.player.y, self.player.z
         pcx = int(math.floor(px / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER
         pcy = int(math.floor(py / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER
         pcz = int(math.floor(pz / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER
+        yaw_bucket = int((self.player.yRot % 360.0) / 20.0) if cull_behind else 0
+        cache_key = (pcx, pcy, pcz, yaw_bucket, extra_chunks, cull_behind, self.java_visible_cache_epoch)
+        cached = self.java_visible_cache.get(cache_key)
+        if cached is not None:
+            return cached
         look_x = math.sin(math.radians(self.player.yRot))
         look_z = -math.cos(math.radians(self.player.yRot))
         visible_chunks = []
 
-        for key, c in list(self.java_chunks.items()):
-            cx, cy, cz = key
-            chunk_center_x = cx + 8
-            chunk_center_z = cz + 8
-            dx = chunk_center_x - px
-            dz = chunk_center_z - pz
-            dy = cy - pcy
+        horiz_radius = (JAVA_RENDER_DIST_CHUNKS + extra_chunks) * CHUNK_SIZE_RENDER
+        vert_radius = (JAVA_VERTICAL_RENDER_CHUNKS + extra_chunks) * CHUNK_SIZE_RENDER
 
-            if abs(cx - pcx) > JAVA_RENDER_DIST_CHUNKS * CHUNK_SIZE_RENDER:
-                continue
-            if abs(cz - pcz) > JAVA_RENDER_DIST_CHUNKS * CHUNK_SIZE_RENDER:
-                continue
-            if abs(dy) > JAVA_VERTICAL_RENDER_CHUNKS * CHUNK_SIZE_RENDER:
-                continue
-            if dx * look_x + dz * look_z < -8:
-                continue
-            visible_chunks.append((dx * dx + dz * dz + dy * dy, key, c))
+        for cx in range(pcx - horiz_radius, pcx + horiz_radius + CHUNK_SIZE_RENDER, CHUNK_SIZE_RENDER):
+            for cy in range(pcy - vert_radius, pcy + vert_radius + CHUNK_SIZE_RENDER, CHUNK_SIZE_RENDER):
+                for cz in range(pcz - horiz_radius, pcz + horiz_radius + CHUNK_SIZE_RENDER, CHUNK_SIZE_RENDER):
+                    c = self.java_chunks.get((cx, cy, cz))
+                    if not c:
+                        continue
+
+                    chunk_center_x = cx + 8
+                    chunk_center_z = cz + 8
+                    dx = chunk_center_x - px
+                    dz = chunk_center_z - pz
+                    dy = cy - pcy
+
+                    if cull_behind and extra_chunks <= 0 and dx * look_x + dz * look_z < -24:
+                        continue
+                    visible_chunks.append((dx * dx + dz * dz + dy * dy, (cx, cy, cz), c))
 
         visible_chunks.sort(key=lambda item: item[0])
+        self.java_visible_cache = {cache_key: visible_chunks}
         return visible_chunks
+
+    def _build_java_chunks_with_budget(self, visible_chunks, max_builds, frame_budget_ms):
+        built_now = 0
+        deadline = time.perf_counter() + (frame_budget_ms / 1000.0)
+        for _, key, c in visible_chunks:
+            if built_now >= max_builds or time.perf_counter() >= deadline:
+                break
+            if not (c.dirty or not c.list_id):
+                continue
+            try:
+                if c.list_id is None or (isinstance(c.list_id, int) and c.list_id <= 0):
+                    c.list_id = glGenLists(1)
+                c.build()
+                built_now += 1
+            except Exception as e:
+                print(f"[BUILD ERROR] chunk {key}: {e}")
+                c.dirty = True
+        return built_now
+
+    def respawn_local_player_to_center(self):
+        center_x = MAP_W / 2.0
+        center_z = MAP_H / 2.0
+        center_block_x = min(MAP_W - 1, max(0, int(center_x)))
+        center_block_z = min(MAP_H - 1, max(0, int(center_z)))
+        spawn_y = 33.0
+        for y in range(MAP_D - 1, -1, -1):
+            if self.level.blocks[center_block_x, y, center_block_z] > 0:
+                spawn_y = y + 3.62
+                break
+
+        self.player.x = center_x
+        self.player.y = spawn_y
+        self.player.z = center_z
+        self.player.xd = 0
+        self.player.yd = 0
+        self.player.zd = 0
+        feet_y = spawn_y - 1.62
+        self.player.bb = AABB(center_x-0.3, feet_y, center_z-0.3, center_x+0.3, feet_y+1.8, center_z+0.3)
+        self.player.onGround = False
 
     def render_game_world(self, is_java=False):
         """Rendu 3D commun"""
         if is_java and self.java_loading:
+            if self.java_client:
+                self.java_client._drain_decoded_chunks(12)
             dirty = []
             if self.java_client:
                 with self.java_client.chunk_lock:
@@ -1578,19 +2499,11 @@ class RubyDung:
                 c = self.get_or_create_java_chunk(*key)
                 c.dirty = True
 
-            built_now = 0
-            for _, key, c in self._get_java_visible_chunks():
-                if built_now >= JAVA_LOADING_BUILD_BUDGET:
-                    break
-                if c.dirty or not c.list_id:
-                    try:
-                        if c.list_id is None or (isinstance(c.list_id, int) and c.list_id <= 0):
-                            c.list_id = glGenLists(1)
-                        c.build()
-                        built_now += 1
-                    except Exception as e:
-                        print(f"[BUILD ERROR] chunk {key}: {e}")
-                        c.dirty = True
+            self._build_java_chunks_with_budget(
+                self._get_java_visible_chunks(extra_chunks=JAVA_PREFETCH_CHUNKS),
+                JAVA_LOADING_BUILD_BUDGET,
+                JAVA_LOADING_FRAME_BUDGET_MS,
+            )
 
         if is_java and self.java_loading and not self._java_loading_done():
             glClearColor(0.05, 0.08, 0.12, 1.0)
@@ -1615,11 +2528,17 @@ class RubyDung:
         dx, dy = pygame.mouse.get_rel()
         self.player.yRot += dx * 0.15
         self.player.xRot = max(-90, min(90, self.player.xRot + dy * 0.15))
+        self.process_pending_java_break()
 
         if not is_java:
             self.player.tick()
+            if self.player.y < -10:
+                self.respawn_local_player_to_center()
         else:
-            self._java_player_tick()
+            if self.java_client and self.java_client.gamemode == 0:
+                self.player.tick()
+            else:
+                self._java_player_tick()
         
         glMatrixMode(GL_PROJECTION); glLoadIdentity()
         gluPerspective(70, WIDTH/HEIGHT, 0.1, 512)
@@ -1632,34 +2551,26 @@ class RubyDung:
         glTranslatef(-self.player.x, -self.player.y, -self.player.z)
         
         if is_java:
+            if self.java_client:
+                self.java_client._drain_decoded_chunks(8)
             glDisable(GL_TEXTURE_2D)
 
-            # Pull dirty chunk notifications from the networking thread in a thread-safe way.
-            dirty = []
-            if self.java_client:
-                with self.java_client.chunk_lock:
-                    dirty = list(self.java_client.dirty_chunks)
-                    self.java_client.dirty_chunks.clear()
+            # Batch block placement/break updates so only touched chunks refresh,
+            # and not on every single frame.
+            self.update_java_chunks()
 
-            # Mark the visible render chunks as dirty so they get rebuilt on the GL thread.
-            for key in dirty:
-                c = self.get_or_create_java_chunk(*key)
-                c.dirty = True
-
-            visible_chunks = self._get_java_visible_chunks()
+            visible_chunks = self._get_java_visible_chunks(extra_chunks=JAVA_RENDER_KEEP_CHUNKS)
             rebuilds_left = JAVA_REBUILD_BUDGET
+            if time.time() < self.java_block_burst_until:
+                rebuilds_left = max(rebuilds_left, JAVA_BLOCK_REBUILD_BUDGET)
+
+            self._build_java_chunks_with_budget(
+                visible_chunks,
+                rebuilds_left,
+                JAVA_REBUILD_FRAME_BUDGET_MS,
+            )
 
             for _, key, c in visible_chunks:
-                if c.dirty and rebuilds_left > 0:
-                    try:
-                        if c.list_id is None or (isinstance(c.list_id, int) and c.list_id <= 0):
-                            c.list_id = glGenLists(1)
-                        c.build()
-                        rebuilds_left -= 1
-                    except Exception as e:
-                        print(f"[BUILD ERROR] chunk {key}: {e}")
-                        c.dirty = True
-
                 if c.list_id:
                     try:
                         glCallList(c.list_id)
@@ -1694,11 +2605,16 @@ class RubyDung:
         if is_java:
             # HUD status
             self.draw_text(self.java_status, 10, 30, (255, 255, 100), small=True)
+            self.draw_text("R - reload chunks", WIDTH - 230, 30, (255, 255, 255), small=True)
             nc = len(self.java_chunks)
             self.draw_text(f"Chunks: {nc}  Pos: ({self.player.x:.1f}, {self.player.y:.1f}, {self.player.z:.1f})", 
                           10, 55, (200, 200, 200), small=True)
             nb = len(self.level.java_blocks)
             self.draw_text(f"Blocks in memory: {nb}", 10, 80, (200, 200, 200), small=True)
+            self.draw_fps(is_java=True)
+
+        if self.state in [self.STATE_GAME, self.STATE_JAVA_GAME]:
+            self.draw_hotbar()
 
     def _java_player_tick(self):
         """Mouvement flottant en mode Java (spectateur)"""
@@ -1729,7 +2645,11 @@ class RubyDung:
             for ev in pygame.event.get():
                 if ev.type == QUIT:
                     if self.java_client: self.java_client.disconnect()
+                    self.stop_host_lan_services()
                     return
+                if ev.type == VIDEORESIZE:
+                    self.resize_window(ev.w, ev.h)
+                    continue
                 if ev.type == KEYDOWN:
                     if ev.key == K_ESCAPE:
                         if self.state in [self.STATE_GAME, self.STATE_JAVA_GAME]:
@@ -1741,11 +2661,19 @@ class RubyDung:
                                 self.java_client = None
                                 self.level = Level(MAP_W, MAP_D, MAP_H)
                                 self.player = Player(self.level)
+                            self.stop_host_lan_services()
                         elif self.state == self.STATE_IP_INPUT:
                             self.state = self.STATE_MENU
                         else:
                             if self.java_client: self.java_client.disconnect()
+                            self.stop_host_lan_services()
                             return
+
+                    if self.state in [self.STATE_GAME, self.STATE_JAVA_GAME]:
+                        if ev.key in [K_1, K_KP1]:
+                            self.select_hotbar_slot(0)
+                        elif ev.key in [K_2, K_KP2]:
+                            self.select_hotbar_slot(1)
                     
                     if self.state == self.STATE_MENU:
                         if ev.key in [K_1, K_KP1]:
@@ -1753,8 +2681,7 @@ class RubyDung:
                             pygame.mouse.set_visible(False); pygame.event.set_grab(True)
                         elif ev.key in [K_2, K_KP2]:
                             self.state = self.STATE_GAME
-                            threading.Thread(target=self.network_thread, args=(True,), daemon=True).start()
-                            threading.Thread(target=self.broadcast_host, daemon=True).start()
+                            self.start_host_lan_services()
                             pygame.mouse.set_visible(False); pygame.event.set_grab(True)
                         elif ev.key in [K_3, K_KP3]:
                             self.state = self.STATE_GAME
@@ -1767,6 +2694,9 @@ class RubyDung:
                     elif self.state == self.STATE_IP_INPUT:
                         if self.ip_screen:
                             self.ip_screen.handle_event(ev)
+
+                    elif self.state == self.STATE_JAVA_GAME and ev.key == K_r:
+                        self.reload_java_nearby_chunks()
                     
                     elif self.state == self.STATE_GAME and ev.type == KEYDOWN:
                         pass
@@ -1777,7 +2707,36 @@ class RubyDung:
                 if self.state == self.STATE_GAME and ev.type == MOUSEBUTTONDOWN:
                     t, p = self.get_ray()
                     if ev.button == 1 and t: self.set_block(t, 0)
-                    if ev.button == 3 and p: self.set_block(p, 1)
+                    if ev.button == 3 and p: self.set_block(p, self.get_selected_block_id())
+
+                if self.state == self.STATE_JAVA_GAME and ev.type == MOUSEBUTTONDOWN and self.java_client:
+                    t, p = self.get_ray()
+                    if ev.button == 1 and t:
+                        broken_block = self.level.get_block(*t)
+                        face = self.get_block_face(t, p)
+                        if self.is_java_survival():
+                            if broken_block == 0:
+                                continue
+                            if self.java_client.send_dig_status(0, t, face):
+                                self.last_java_break_time = time.time()
+                                break_time = self.get_java_survival_break_time(broken_block)
+                                self.pending_java_break = {
+                                    "pos": t,
+                                    "face": face,
+                                    "block_id": broken_block,
+                                    "ready_time": self.last_java_break_time + break_time,
+                                }
+                        elif self.java_client.send_dig_block(t, face):
+                            self.apply_local_java_block_change(t, 0)
+                    if ev.button == 3 and t and p:
+                        selected_block = self.get_selected_block_id()
+                        if self.is_java_survival() and not self.consume_hotbar_resource(selected_block, 1):
+                            self.java_status = "No blocks in selected slot"
+                            continue
+                        if self.java_client.send_place_block(t, self.get_block_face(t, p), selected_block):
+                            self.apply_local_java_block_change(p, self.get_selected_block_id())
+                        elif self.is_java_survival():
+                            self.add_hotbar_resource(selected_block, 1)
             
             # Check whether the Java connection form was completed.
             if self.state == self.STATE_IP_INPUT and self.ip_screen:
@@ -1804,9 +2763,13 @@ class RubyDung:
                 self.render_game_world(is_java=False)
             elif self.state == self.STATE_JAVA_GAME:
                 self.render_game_world(is_java=True)
+
+            if self.state != self.STATE_JAVA_GAME:
+                self.draw_fps(is_java=False)
             
             pygame.display.flip()
             clock.tick(60)
+            self.current_fps = clock.get_fps()
 
     def get_ray(self):
         x, y, z = self.player.x, self.player.y, self.player.z
@@ -1823,6 +2786,8 @@ class RubyDung:
         if 0 <= x < MAP_W and 0 <= y < MAP_D and 0 <= z < MAP_H:
             if self.level.blocks[x,y,z] == b: return
             self.level.blocks[x,y,z] = b
+            if self.java_lan_server:
+                self.java_lan_server.broadcast_block_change(pos, b)
             if sync: self.pending_blocks.append((pos, b))
             for c in self.chunks:
                 if x >= c.pos[0] and x < c.pos[0]+16 and y >= c.pos[1] and y < c.pos[1]+16 and z >= c.pos[2] and z < c.pos[2]+16:
