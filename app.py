@@ -226,12 +226,17 @@ JAVA_NON_CUBE_BLOCKS = {
 # from terrain.png while keeping every other imported Java block color-based.
 JAVA_TERRAIN_TILES = {
     1: (0, 0),  # stone
+    4: (0, 0),  # cobblestone (using the stone texture to optimize)
+    98: (0, 0), # stone brick (using the stone texture to optimize combo x2)
+    48: (0, 0), # mossy cobblestone (using the stone texture to optimize combo x3)
+    7: (0, 0),  # bedrock (using the stone texture to optimize combo x4)
     2: (1, 0),  # grass
     3: (2, 0),  # dirt
     17: (3, 0), # tree logs
     5: (4, 0),  # wood plank
     18: (5, 0), # tree leaves
     12: (6, 0), # sand
+    53: (4, 0), # oak stairs (using the oak wood texture because blocs can be only cubes)
 }
 
 def block_coord(v):
