@@ -35,10 +35,15 @@ JAVA_BLOCK_BURST_SECONDS = 0.25
 JAVA_BLOCK_REBUILD_BUDGET = 2
 JAVA_CHUNK_WORKERS = max(2, min(8, os.cpu_count() or 4))
 JAVA_CHUNK_QUEUE_LIMIT = 128
+JAVA_VIEW_RECENTER_STEP = 2
 JAVA_LAN_PORT_DEFAULT = 25565
 JAVA_LAN_MULTICAST_GROUP = "224.0.2.60"
 JAVA_LAN_MULTICAST_PORT = 4445
 PORT = 5555
+STEVE_TERRAIN_TOP_TILE = (15, 7)
+STEVE_TERRAIN_BOTTOM_TILE = (15, 6)
+STEVE_TERRAIN_SIDE_TOP_TILE = (14, 7)
+STEVE_TERRAIN_SIDE_BOTTOM_TILE = (14, 6)
 
 # =====================================================================
 # PROTOCOLE MINECRAFT JAVA (1.8 / Protocole 47)
@@ -223,6 +228,10 @@ JAVA_TERRAIN_TILES = {
     1: (0, 0),  # stone
     2: (1, 0),  # grass
     3: (2, 0),  # dirt
+    17: (3, 0), # tree logs
+    5: (4, 0),  # wood plank
+    18: (5, 0), # tree leaves
+    12: (6, 0), # sand
 }
 
 def block_coord(v):
@@ -1192,35 +1201,30 @@ class MinecraftJavaClient:
     def _apply_decoded_chunk(self, chunk_x, chunk_z, ground_up, section_ys, new_blocks):
         with self.chunk_lock:
             affected = set()
+            chunk_keys_for_column = [
+                key for key in self.level.java_chunk_blocks
+                if key[0] // 16 == chunk_x and key[2] // 16 == chunk_z
+            ]
             if ground_up:
-                to_del = [k for k in self.level.java_blocks
-                          if k[0] // 16 == chunk_x and k[2] // 16 == chunk_z]
-                for k in to_del:
-                    del self.level.java_blocks[k]
-                chunk_keys_to_del = [
-                    key for key in self.level.java_chunk_blocks
-                    if key[0] // 16 == chunk_x and key[2] // 16 == chunk_z
-                ]
-                for key in chunk_keys_to_del:
+                for key in chunk_keys_for_column:
+                    bucket = self.level.java_chunk_blocks.get(key, {})
+                    for pos in bucket:
+                        self.level.java_blocks.pop(pos, None)
                     del self.level.java_chunk_blocks[key]
                     self.level.java_visible_chunk_blocks.pop(key, None)
-                affected.update(chunk_keys_to_del)
+                affected.update(chunk_keys_for_column)
             elif section_ys:
                 sections = set(section_ys)
-                to_del = [
-                    k for k in self.level.java_blocks
-                    if k[0] // 16 == chunk_x and k[2] // 16 == chunk_z and (k[1] // 16) in sections
-                ]
-                for k in to_del:
-                    del self.level.java_blocks[k]
                 chunk_keys_to_rebuild = set()
-                for key, bucket in list(self.level.java_chunk_blocks.items()):
-                    if key[0] // 16 != chunk_x or key[2] // 16 != chunk_z:
-                        continue
+                for key in chunk_keys_for_column:
+                    bucket = self.level.java_chunk_blocks.get(key, {})
                     kept = {
                         pos: bid for pos, bid in bucket.items()
                         if (pos[1] // 16) not in sections
                     }
+                    for pos in bucket:
+                        if (pos[1] // 16) in sections:
+                            self.level.java_blocks.pop(pos, None)
                     if kept:
                         self.level.java_chunk_blocks[key] = kept
                     else:
@@ -1321,6 +1325,7 @@ class MinecraftJavaClient:
                         self.level.java_chunk_blocks[key] = {}
                     self.level.java_chunk_blocks[key][(bx, by, bz)] = block_id
 
+                self.level.java_visible_chunk_blocks.pop(key, None)
                 self._mark_dirty_block_chunks(bx, by, bz)
         except:
             pass
@@ -1359,6 +1364,7 @@ class MinecraftJavaClient:
                             self.level.java_chunk_blocks[key] = {}
                         self.level.java_chunk_blocks[key][(bx, y, bz)] = block_id
 
+                    self.level.java_visible_chunk_blocks.pop(key, None)
                     self._mark_dirty_block_chunks(bx, y, bz)
         except:
             pass
@@ -1930,6 +1936,7 @@ class RubyDung:
         self.java_lan_server = None
         self.java_visible_cache = {}
         self.java_visible_cache_epoch = 0
+        self.java_view_anchor = None
         self.hotbar_blocks = [("Stone", 1, (120, 120, 120)), ("Grass", 2, (80, 170, 80))]
         self.selected_hotbar = 0
         self.hotbar_counts = {1: 999, 2: 999}
@@ -2103,6 +2110,7 @@ class RubyDung:
         self.java_last_ip = ip
         self.java_last_port = int(port)
         self.java_last_username = username
+        self.tex = self.load_texture("terrain.png")
 
         if self.java_client:
             self.java_client.disconnect()
@@ -2115,6 +2123,7 @@ class RubyDung:
         self.java_chunks = {}
         self.java_visible_cache = {}
         self.java_visible_cache_epoch = 0
+        self.java_view_anchor = None
         self.reset_java_survival_inventory()
         self.last_java_break_time = 0.0
         self.pending_java_break = None
@@ -2134,6 +2143,25 @@ class RubyDung:
     def on_java_status(self, msg):
         self.java_status = msg
         print("[JAVA]", msg)
+
+    def _get_java_view_anchor(self):
+        px, py, pz = self.player.x, self.player.y, self.player.z
+        player_chunk = (
+            int(math.floor(px / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER,
+            int(math.floor(py / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER,
+            int(math.floor(pz / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER,
+        )
+        anchor = self.java_view_anchor
+        if anchor is None:
+            self.java_view_anchor = player_chunk
+            return player_chunk
+
+        step = JAVA_VIEW_RECENTER_STEP * CHUNK_SIZE_RENDER
+        if abs(player_chunk[0] - anchor[0]) >= step or abs(player_chunk[2] - anchor[2]) >= step:
+            self.java_view_anchor = player_chunk
+            self.java_visible_cache.clear()
+            return player_chunk
+        return anchor
 
     def get_or_create_java_chunk(self, cx, cy, cz):
         """Called only from the main OpenGL thread."""
@@ -2175,6 +2203,8 @@ class RubyDung:
     def reload_java_nearby_chunks(self):
         if not self.java_last_ip or self.java_last_port is None or not self.java_last_username:
             return
+        self.tex = self.load_texture("terrain.png")
+        self.level.java_terrain_tex = self.tex
         self.java_status = "Reloading chunks from server..."
         self.start_java_connection(self.java_last_ip, self.java_last_port, self.java_last_username)
 
@@ -2212,18 +2242,47 @@ class RubyDung:
         glTexCoord2f(u0, v0); glVertex3f(x0, y1, z0)
         glEnd()
 
+    def draw_terrain_cube_face(self, x0, y0, z0, x1, y1, z1, tile_x, tile_y):
+        u0 = tile_x / 16.0
+        v0 = tile_y / 16.0
+        u1 = (tile_x + 1) / 16.0
+        v1 = (tile_y + 1) / 16.0
+        glBegin(GL_QUADS)
+        glTexCoord2f(u0, v1); glVertex3f(x0, y0, z0)
+        glTexCoord2f(u1, v1); glVertex3f(x1, y0, z1)
+        glTexCoord2f(u1, v0); glVertex3f(x1, y1, z1)
+        glTexCoord2f(u0, v0); glVertex3f(x0, y1, z0)
+        glEnd()
+
+    def draw_terrain_cube_face_rect(self, x0, y0, z0, x1, y1, z1, tile_x, tile_y, x_pixels0, x_pixels1):
+        u0 = (tile_x + (x_pixels0 / 16.0)) / 16.0
+        u1 = (tile_x + (x_pixels1 / 16.0)) / 16.0
+        v0 = tile_y / 16.0
+        v1 = (tile_y + 1) / 16.0
+        glBegin(GL_QUADS)
+        glTexCoord2f(u0, v1); glVertex3f(x0, y0, z0)
+        glTexCoord2f(u1, v1); glVertex3f(x1, y0, z1)
+        glTexCoord2f(u1, v0); glVertex3f(x1, y1, z1)
+        glTexCoord2f(u0, v0); glVertex3f(x0, y1, z0)
+        glEnd()
+
     # Java players and LAN players do not share the same facing fix:
     # LAN keeps the original local protocol orientation, while Java uses the
     # corrected model-facing offset needed for real Minecraft clients.
     def draw_steve(self, pos):
         rx, ry, rz, rr = pos
         glPushMatrix(); glTranslatef(rx, ry-1.6, rz); glRotatef(180.0 - rr, 0, 1, 0)
-        glBindTexture(GL_TEXTURE_2D, self.skin_tex)
-        self.draw_cube_face(-0.375, 0.0, 0.125, 0.375, 1.75, 0.125, 8, 0, 16, 32)
-        self.draw_cube_face(0.375, 0.0, -0.125, -0.375, 1.75, -0.125, 0, 0, 8, 32)
-        self.draw_cube_face(-0.375, 0.0, -0.125, -0.375, 1.75, 0.125, 7.5, 0, 8.5, 32)
-        self.draw_cube_face(0.375, 0.0, 0.125, 0.375, 1.75, -0.125, 7.5, 0, 8.5, 32)
-        self.draw_cube_face(-0.375, 1.75, 0.125, 0.375, 1.75, -0.125, 8, 0, 9, 1)
+        glBindTexture(GL_TEXTURE_2D, self.tex)
+        y_mid = 0.875
+        self.draw_terrain_cube_face_rect(-0.375, y_mid, 0.125, 0.375, 1.75, 0.125, *STEVE_TERRAIN_TOP_TILE, 0, 8)
+        self.draw_terrain_cube_face_rect(-0.375, 0.0, 0.125, 0.375, y_mid, 0.125, *STEVE_TERRAIN_BOTTOM_TILE, 0, 8)
+        self.draw_terrain_cube_face_rect(0.375, y_mid, -0.125, -0.375, 1.75, -0.125, *STEVE_TERRAIN_TOP_TILE, 8, 16)
+        self.draw_terrain_cube_face_rect(0.375, 0.0, -0.125, -0.375, y_mid, -0.125, *STEVE_TERRAIN_BOTTOM_TILE, 8, 16)
+        self.draw_terrain_cube_face(-0.375, y_mid, -0.125, -0.375, 1.75, 0.125, *STEVE_TERRAIN_SIDE_TOP_TILE)
+        self.draw_terrain_cube_face(-0.375, 0.0, -0.125, -0.375, y_mid, 0.125, *STEVE_TERRAIN_SIDE_BOTTOM_TILE)
+        self.draw_terrain_cube_face(0.375, y_mid, 0.125, 0.375, 1.75, -0.125, *STEVE_TERRAIN_SIDE_TOP_TILE)
+        self.draw_terrain_cube_face(0.375, 0.0, 0.125, 0.375, y_mid, -0.125, *STEVE_TERRAIN_SIDE_BOTTOM_TILE)
+        self.draw_terrain_cube_face(-0.375, 1.75, 0.125, 0.375, 1.75, -0.125, *STEVE_TERRAIN_TOP_TILE)
         glPopMatrix()
         if self.tex: glBindTexture(GL_TEXTURE_2D, self.tex)
 
@@ -2232,12 +2291,17 @@ class RubyDung:
         glPushMatrix(); glTranslatef(rx, ry-1.6, rz); glRotatef(-rr, 0, 1, 0)
         glEnable(GL_TEXTURE_2D)
         glColor3f(1.0, 1.0, 1.0)
-        glBindTexture(GL_TEXTURE_2D, self.skin_tex)
-        self.draw_cube_face(-0.375, 0.0, 0.125, 0.375, 1.75, 0.125, 8, 0, 16, 32)
-        self.draw_cube_face(0.375, 0.0, -0.125, -0.375, 1.75, -0.125, 0, 0, 8, 32)
-        self.draw_cube_face(-0.375, 0.0, -0.125, -0.375, 1.75, 0.125, 7.5, 0, 8.5, 32)
-        self.draw_cube_face(0.375, 0.0, 0.125, 0.375, 1.75, -0.125, 7.5, 0, 8.5, 32)
-        self.draw_cube_face(-0.375, 1.75, 0.125, 0.375, 1.75, -0.125, 8, 0, 9, 1)
+        glBindTexture(GL_TEXTURE_2D, self.tex)
+        y_mid = 0.875
+        self.draw_terrain_cube_face_rect(-0.375, y_mid, 0.125, 0.375, 1.75, 0.125, *STEVE_TERRAIN_TOP_TILE, 0, 8)
+        self.draw_terrain_cube_face_rect(-0.375, 0.0, 0.125, 0.375, y_mid, 0.125, *STEVE_TERRAIN_BOTTOM_TILE, 0, 8)
+        self.draw_terrain_cube_face_rect(0.375, y_mid, -0.125, -0.375, 1.75, -0.125, *STEVE_TERRAIN_TOP_TILE, 8, 16)
+        self.draw_terrain_cube_face_rect(0.375, 0.0, -0.125, -0.375, y_mid, -0.125, *STEVE_TERRAIN_BOTTOM_TILE, 8, 16)
+        self.draw_terrain_cube_face(-0.375, y_mid, -0.125, -0.375, 1.75, 0.125, *STEVE_TERRAIN_SIDE_TOP_TILE)
+        self.draw_terrain_cube_face(-0.375, 0.0, -0.125, -0.375, y_mid, 0.125, *STEVE_TERRAIN_SIDE_BOTTOM_TILE)
+        self.draw_terrain_cube_face(0.375, y_mid, 0.125, 0.375, 1.75, -0.125, *STEVE_TERRAIN_SIDE_TOP_TILE)
+        self.draw_terrain_cube_face(0.375, 0.0, 0.125, 0.375, y_mid, -0.125, *STEVE_TERRAIN_SIDE_BOTTOM_TILE)
+        self.draw_terrain_cube_face(-0.375, 1.75, 0.125, 0.375, 1.75, -0.125, *STEVE_TERRAIN_TOP_TILE)
         glPopMatrix()
         if self.tex: glBindTexture(GL_TEXTURE_2D, self.tex)
 
@@ -2410,9 +2474,7 @@ class RubyDung:
 
     def _get_java_visible_chunks(self, extra_chunks=0, cull_behind=False):
         px, py, pz = self.player.x, self.player.y, self.player.z
-        pcx = int(math.floor(px / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER
-        pcy = int(math.floor(py / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER
-        pcz = int(math.floor(pz / CHUNK_SIZE_RENDER)) * CHUNK_SIZE_RENDER
+        pcx, pcy, pcz = self._get_java_view_anchor()
         yaw_bucket = int((self.player.yRot % 360.0) / 20.0) if cull_behind else 0
         cache_key = (pcx, pcy, pcz, yaw_bucket, extra_chunks, cull_behind, self.java_visible_cache_epoch)
         cached = self.java_visible_cache.get(cache_key)
