@@ -442,14 +442,15 @@ class Player:
         self.bb = AABB(self.x-0.3, self.y-1.6, self.z-0.3, self.x+0.3, self.y+0.2, self.z+0.3)
         self.onGround = False
 
-    def tick(self):
+    def tick(self, ignore_input=False):
         keys = pygame.key.get_pressed()
         xa, za = 0, 0
-        if keys[K_z] or keys[K_w]: za -= 1
-        if keys[K_s]: za += 1
-        if keys[K_q] or keys[K_a]: xa -= 1
-        if keys[K_d]: xa += 1
-        if keys[K_SPACE] and self.onGround: self.yd = 0.12
+        if not ignore_input:
+            if keys[K_z] or keys[K_w]: za -= 1
+            if keys[K_s]: za += 1
+            if keys[K_q] or keys[K_a]: xa -= 1
+            if keys[K_d]: xa += 1
+            if keys[K_SPACE] and self.onGround: self.yd = 0.12
         speed = 0.04 if self.onGround else 0.02
         m = math.sqrt(xa*xa + za*za)
         if m > 0.01:
@@ -1462,6 +1463,17 @@ class MinecraftJavaClient:
             print(f"[CLIENT] Erreur place block: {e}")
             return False
 
+    def send_chat_message(self, message):
+        try:
+            text = str(message).strip()
+            if not text:
+                return False
+            self._send(0x01, write_string(text[:256]))
+            return True
+        except Exception as e:
+            print(f"[CLIENT] Erreur chat: {e}")
+            return False
+
     def disconnect(self):
         self.connected = False
         self._drain_decoded_chunks()
@@ -1955,6 +1967,8 @@ class RubyDung:
         self.hotbar_counts = {1: 999, 2: 999}
         self.last_java_break_time = 0.0
         self.pending_java_break = None
+        self.java_chat_active = False
+        self.java_chat_text = ""
         self.ip_screen = None
         self.current_fps = 0.0
         glViewport(0, 0, WIDTH, HEIGHT)
@@ -1983,6 +1997,49 @@ class RubyDung:
 
     def reset_java_survival_inventory(self):
         self.hotbar_counts = {1: 0, 2: 0}
+
+    def open_java_chat(self):
+        self.java_chat_active = True
+        self.java_chat_text = ""
+        self.java_status = "Chat ready"
+
+    def close_java_chat(self):
+        self.java_chat_active = False
+        self.java_chat_text = ""
+
+    def submit_java_chat(self):
+        if not self.java_client:
+            self.close_java_chat()
+            return
+        message = self.java_chat_text.strip()
+        if not message:
+            self.close_java_chat()
+            return
+        if self.java_client.send_chat_message(message):
+            self.java_status = f"Sent: {message[:48]}"
+        else:
+            self.java_status = "Chat send failed"
+        self.close_java_chat()
+
+    def handle_java_chat_keydown(self, ev):
+        if ev.key == K_ESCAPE:
+            self.close_java_chat()
+            self.java_status = "Chat cancelled"
+            return True
+        if ev.key in (K_RETURN, K_KP_ENTER):
+            self.submit_java_chat()
+            return True
+        if ev.key == K_BACKSPACE:
+            self.java_chat_text = self.java_chat_text[:-1]
+            return True
+        if ev.key == K_t and not self.java_chat_text:
+            return True
+
+        char = getattr(ev, "unicode", "")
+        if char and char.isprintable() and len(self.java_chat_text) < 256:
+            self.java_chat_text += char
+            return True
+        return False
 
     def add_hotbar_resource(self, block_id, amount=1):
         if block_id in self.hotbar_counts:
@@ -2337,6 +2394,13 @@ class RubyDung:
         y = 110 if is_java else 45
         self.draw_text(f"FPS: {self.current_fps:.0f}", 10, y, (255, 255, 255), small=True)
 
+    def draw_java_chat_overlay(self):
+        if self.java_chat_active:
+            text = f"T - chat: {self.java_chat_text}_"
+        else:
+            text = "T - chat"
+        self.draw_text(text, WIDTH - 230, 55, (255, 255, 255), small=True)
+
     def draw_ui_block_tile(self, block_id, x, y, size=26):
         if not self.tex:
             return
@@ -2600,9 +2664,12 @@ class RubyDung:
             self.java_loading = False
             self.java_status = "Loading complete - entering game"
 
-        dx, dy = pygame.mouse.get_rel()
-        self.player.yRot += dx * 0.15
-        self.player.xRot = max(-90, min(90, self.player.xRot + dy * 0.15))
+        if self.java_chat_active:
+            pygame.mouse.get_rel()
+        else:
+            dx, dy = pygame.mouse.get_rel()
+            self.player.yRot += dx * 0.15
+            self.player.xRot = max(-90, min(90, self.player.xRot + dy * 0.15))
         self.process_pending_java_break()
 
         if not is_java:
@@ -2611,8 +2678,8 @@ class RubyDung:
                 self.respawn_local_player_to_center()
         else:
             if self.java_client and self.java_client.gamemode == 0:
-                self.player.tick()
-            else:
+                self.player.tick(ignore_input=self.java_chat_active)
+            elif not self.java_chat_active:
                 self._java_player_tick()
         
         glMatrixMode(GL_PROJECTION); glLoadIdentity()
@@ -2681,6 +2748,7 @@ class RubyDung:
             # HUD status
             self.draw_text(self.java_status, 10, 30, (255, 255, 100), small=True)
             self.draw_text("R - reload chunks", WIDTH - 230, 30, (255, 255, 255), small=True)
+            self.draw_java_chat_overlay()
             nc = len(self.java_chunks)
             self.draw_text(f"Chunks: {nc}  Pos: ({self.player.x:.1f}, {self.player.y:.1f}, {self.player.z:.1f})", 
                           10, 55, (200, 200, 200), small=True)
@@ -2726,8 +2794,15 @@ class RubyDung:
                     self.resize_window(ev.w, ev.h)
                     continue
                 if ev.type == KEYDOWN:
+                    if self.state == self.STATE_JAVA_GAME and self.java_chat_active:
+                        if self.handle_java_chat_keydown(ev):
+                            continue
+
                     if ev.key == K_ESCAPE:
                         if self.state in [self.STATE_GAME, self.STATE_JAVA_GAME]:
+                            if self.state == self.STATE_JAVA_GAME and self.java_chat_active:
+                                self.close_java_chat()
+                                continue
                             pygame.mouse.set_visible(True)
                             pygame.event.set_grab(False)
                             self.state = self.STATE_MENU
@@ -2770,6 +2845,9 @@ class RubyDung:
                         if self.ip_screen:
                             self.ip_screen.handle_event(ev)
 
+                    elif self.state == self.STATE_JAVA_GAME and ev.key == K_t and self.java_client:
+                        self.open_java_chat()
+
                     elif self.state == self.STATE_JAVA_GAME and ev.key == K_r:
                         self.reload_java_nearby_chunks()
                     
@@ -2784,7 +2862,7 @@ class RubyDung:
                     if ev.button == 1 and t: self.set_block(t, 0)
                     if ev.button == 3 and p: self.set_block(p, self.get_selected_block_id())
 
-                if self.state == self.STATE_JAVA_GAME and ev.type == MOUSEBUTTONDOWN and self.java_client:
+                if self.state == self.STATE_JAVA_GAME and ev.type == MOUSEBUTTONDOWN and self.java_client and not self.java_chat_active:
                     t, p = self.get_ray()
                     if ev.button == 1 and t:
                         broken_block = self.level.get_block(*t)
