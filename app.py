@@ -202,12 +202,15 @@ BLOCK_COLORS = {
     53: (0.7, 0.5, 0.3),  # Oak stairs
     56: (0.4, 0.7, 0.8),  # Diamond ore
     57: (0.5, 0.9, 0.9),  # Diamond block
+    60: (0.55, 0.35, 0.1),# farmland
+    64: (0.7, 0.5, 0.3),  # oak door
     73: (0.5, 0.2, 0.2),  # Redstone ore
     74: (0.5, 0.2, 0.2),  # Redstone ore glowing
     78: (0.95, 0.95, 1.0),# Snow
     79: (0.7, 0.85, 0.95),# Ice
     80: (0.95, 0.95, 1.0),# Snow block
     82: (0.6, 0.6, 0.7),  # Clay
+    85: (0.7, 0.5, 0.3),  # Wood fence
     86: (0.85, 0.45, 0.1),# Pumpkin
     87: (0.7, 0.3, 0.2),  # Netherrack
     89: (0.9, 0.8, 0.5),  # Glowstone
@@ -228,17 +231,20 @@ JAVA_TERRAIN_TILES = {
     1: (0, 0),  # stone
     2: (1, 0),  # grass
     3: (2, 0),  # dirt
-    4: (0, 0),  # cobblestone (using the stone texture to optimize)
+    4: (7, 0),  # cobblestone
     5: (4, 0),  # wood plank
-    7: (0, 0),  # bedrock (using the stone texture to optimize combo x2)
+    7: (7, 0),  # bedrock
     12: (6, 0), # sand
     17: (3, 0), # tree logs
     18: (5, 0), # tree leaves
-    43: (0, 0), # double slab (using the stone texture to optimize combo x3)
-    44: (0, 0), # slab (using the stone texture to optimize combo x4)
-    48: (0, 0), # mossy cobblestone (using the stone texture to optimize combo x5)
+    43: (7, 0), # double slab 
+    44: (0, 0), # slab 
+    48: (7, 0), # mossy cobblestone 
     53: (4, 0), # oak stairs (using the oak wood texture because blocs can be only cubes)
-    98: (0, 0), # stone brick (using the stone texture to optimize combo x6)
+    60: (2, 0), # farmland
+    64: (4, 0), # oak door (using the oak wood texture because blocs can be only cubes combo x2)
+    85: (4, 0), # oak fence (using the oak wood texture because blocs can be only cubes combo x3)
+    98: (7, 0), # stone brick 
 }
 
 def block_coord(v):
